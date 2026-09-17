@@ -18,7 +18,10 @@ export function getAuthSecret(): Uint8Array {
 
   if (process.env.NODE_ENV === "production") {
     throw new Error(
-      "AUTH_SECRET is required in production (32+ characters). Refusing to start with an insecure default.",
+      "AUTH_SECRET is required in production (32+ characters). " +
+        "It signs testing-session cookies and does not require login. " +
+        "Set it in your host's environment (Vercel: Settings -> Environment Variables) " +
+        "using a value from `openssl rand -base64 48`, then redeploy.",
     );
   }
 
