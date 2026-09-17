@@ -1,0 +1,23 @@
+{
+  "name": "webstrike",
+  "private": true,
+  "version": "0.1.0",
+  "description": "WebStrike — Vercel-only web application security testing platform for authorized penetration testing.",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace=@webstrike/web",
+    "build": "npm run build --workspace=@webstrike/web",
+    "start": "npm run start --workspace=@webstrike/web",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "lint": "npm run lint --workspace=@webstrike/web"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  }
+}

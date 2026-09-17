@@ -1,0 +1,44 @@
+{
+  "name": "@webstrike/web",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "db:migrate": "node --env-file=.env scripts/migrate.mjs"
+  },
+  "dependencies": {
+    "@hookform/resolvers": "^5.2.2",
+    "@neondatabase/serverless": "^1.1.0",
+    "@tanstack/react-query": "^5.90.2",
+    "@webstrike/security": "*",
+    "@webstrike/testing": "*",
+    "@webstrike/types": "*",
+    "@webstrike/validation": "*",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "drizzle-orm": "^0.45.2",
+    "jose": "^6.2.12",
+    "lucide-react": "^0.545.0",
+    "motion": "^12.23.24",
+    "next": "^16.3.5",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "react-hook-form": "^7.65.0",
+    "tailwind-merge": "^3.3.1",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.1.14",
+    "@types/node": "^24.10.1",
+    "@types/react": "^19.2.2",
+    "@types/react-dom": "^19.2.2",
+    "eslint": "^9.38.0",
+    "eslint-config-next": "^16.3.5",
+    "tailwindcss": "^4.1.14",
+    "typescript": "^5.9.3"
+  }
+}
