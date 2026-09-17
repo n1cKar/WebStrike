@@ -7,12 +7,57 @@ import type {
 /** Verification vocabulary. Automated output is never called a "vulnerability". */
 export type ResultState =
   | "Observation"
+  | "Informational"
   | "Potential Issue"
   | "Needs Verification"
-  | "Verified"
+  | "Verified Security Issue"
   | "Not Reproducible";
 
 export type Confidence = "low" | "medium" | "high";
+
+/** Impact ranking, assigned only after a security consequence is established. */
+export type Severity = "critical" | "high" | "medium" | "low" | "info";
+
+/** How far a result has moved through the verification pipeline. */
+export type VerificationStatus =
+  | "not-required"
+  | "needs-verification"
+  | "reproduced"
+  | "unreproduced";
+
+/** Result prioritisation tiers. Tier 1 is real security impact. */
+export type ResultTier = 1 | 2 | 3;
+
+/**
+ * Endpoint classification drives which tests are meaningful. A login page must
+ * not generate an "authentication bypass" merely because anonymous and
+ * authenticated responses match.
+ */
+export type EndpointClassification =
+  | "PUBLIC"
+  | "AUTHENTICATED"
+  | "PRIVILEGED"
+  | "ADMIN"
+  | "STATE_CHANGING"
+  | "FILE_UPLOAD"
+  | "API"
+  | "AUTHENTICATION"
+  | "REGISTRATION"
+  | "PASSWORD_RESET"
+  | "RESOURCE_ACCESS"
+  | "WORKFLOW";
+
+/** A credential context. Two identities enable authorization comparison. */
+export interface Identity {
+  id: string;
+  label: string;
+  /** Free-form role label (e.g. "user", "admin") for privilege comparison. */
+  role?: string;
+  /** True for an administrative/privileged identity. */
+  privileged?: boolean;
+  headers: { name: string; value: string }[];
+  cookies: { name: string; value: string }[];
+}
 
 export type TestCategory =
   | "security-headers"
@@ -25,14 +70,6 @@ export type TestCategory =
   | "file-upload"
   | "openapi"
   | "browser";
-
-/** A credential context. Two identities enable authorization comparison. */
-export interface Identity {
-  id: string;
-  label: string;
-  headers: { name: string; value: string }[];
-  cookies: { name: string; value: string }[];
-}
 
 /** One outbound request the engine wants executed. */
 export interface AutomatedRequest {
@@ -95,7 +132,38 @@ export interface TestObservation {
   confidence: Confidence;
   summary: string;
   evidence: Evidence;
+  /** The test case that produced this observation (used for verification). */
+  caseId?: string;
+  /** Short directive for the next manual/automated step. */
   guidance?: string;
+
+  /* ---- professional result fields (optional, filled where meaningful) ---- */
+  /** Impact ranking, only set once a security consequence is established. */
+  severity?: Severity;
+  /** Prioritisation tier (1 = real security impact, 3 = hardening). */
+  tier?: ResultTier;
+  /** Endpoint this result concerns, when known. */
+  endpoint?: string;
+  /** Identity whose request produced the decisive evidence. */
+  identityId?: string;
+  /** What correct behaviour would have been. */
+  expected?: string;
+  /** What was actually observed. */
+  observed?: string;
+  /** Why the difference is security-relevant. */
+  impact?: string;
+  /** How the conclusion was reached. */
+  reasoning?: string;
+  /** Suggested, safe follow-up test. */
+  nextTest?: string;
+  /** Remediation guidance. */
+  remediation?: string;
+  /** How far the result has progressed through verification. */
+  verification?: VerificationStatus;
+  /** Detail about the verification attempt(s). */
+  verificationDetail?: string;
+  /** Advisory note produced by the optional AI analysis layer. */
+  aiNote?: string;
 }
 
 export interface Progress {
@@ -144,6 +212,12 @@ export interface RunInput {
   openapi?: unknown;
   /** Extra same-scope paths to treat as known surface. */
   seedPaths?: string[];
+  /** Optional advisory AI analysis layer. Never changes state or severity. */
+  ai?: {
+    apiKey?: string;
+    model?: string;
+    max?: number;
+  };
   onProgress?: (progress: Progress) => void;
 }
 
@@ -197,6 +271,8 @@ export interface DiscoveredEndpoint {
   params: DiscoveredParam[];
   source: "start-url" | "link" | "form" | "seed";
   form?: DiscoveredForm;
+  /** Classification assigned during planning; drives test selection. */
+  classifications?: EndpointClassification[];
 }
 
 export interface Surface {

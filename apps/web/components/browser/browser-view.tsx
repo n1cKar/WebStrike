@@ -25,10 +25,11 @@ import { ApiClientError } from "@/lib/api/client";
 import { fetchBrowserStatus, runBrowser, type BrowserStatus } from "@/lib/browser/client";
 
 const STATE_ORDER: TestObservation["state"][] = [
+  "Verified Security Issue",
   "Potential Issue",
   "Needs Verification",
   "Observation",
-  "Verified",
+  "Informational",
   "Not Reproducible",
 ];
 

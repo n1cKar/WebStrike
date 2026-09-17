@@ -201,10 +201,26 @@ describe("authentication accuracy", () => {
     ],
   };
 
-  it("treats identical public content as a low-confidence observation", () => {
+  it("stays silent for a public page whose content matches anonymously", () => {
     const html = "<html><body>About us</body></html>";
     const observations = analyze(
       testCase,
+      {
+        authed: res("https://target.test/about", 200, html),
+        anon: res("https://target.test/about", 200, html),
+      },
+      [authenticatedIdentity],
+    );
+    expect(observations).toEqual([]);
+  });
+
+  it("treats identical content on a sensitive endpoint as a low-confidence observation", () => {
+    const html = "<html><body>About us</body></html>";
+    const observations = analyze(
+      {
+        ...testCase,
+        metadata: { classifications: ["AUTHENTICATED", "API"] },
+      },
       {
         authed: res("https://target.test/about", 200, html),
         anon: res("https://target.test/about", 200, html),

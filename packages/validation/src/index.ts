@@ -173,6 +173,8 @@ const headerRowSchema = z.object({
 export const testingIdentitySchema = z.object({
   id: z.string().trim().min(1).max(40),
   label: z.string().trim().min(1).max(80),
+  role: z.string().trim().max(40).optional(),
+  privileged: z.boolean().optional(),
   headers: z.array(headerRowSchema).max(24).default([]),
   cookies: z.array(requestCookieSchema).max(24).default([]),
 });

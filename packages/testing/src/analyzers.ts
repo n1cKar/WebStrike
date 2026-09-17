@@ -2,7 +2,6 @@ import type { ScopedHttpResult } from "@webstrike/types";
 import { analyzeCookies } from "@webstrike/security";
 import {
   appearsEvaluated,
-  bodySimilarity,
   changedHeaders,
   describeResponse,
   hasErrorSignature,
@@ -14,13 +13,20 @@ import {
   reflectsUnescaped,
 } from "./compare";
 import { makeEvidence } from "./evidence";
+import { diffResponses, hasSubstantiveData, jsonShape } from "./diff";
+import { isAuthFlow, isResourceAccess } from "./classify";
+import { identityMarkers, isPrivileged, markersPresent } from "./identity";
 import type {
   AnalyzeContext,
   Analyzer,
   AutomatedRequest,
   Confidence,
+  EndpointClassification,
   ResultState,
+  ResultTier,
+  Severity,
   TestObservation,
+  VerificationStatus,
 } from "./types";
 
 function pair(ctx: AnalyzeContext, index = 0): { req: AutomatedRequest; res: ScopedHttpResult } | null {
@@ -44,18 +50,45 @@ function observation(
     res: ScopedHttpResult;
     baseline?: ScopedHttpResult;
     guidance?: string;
+    severity?: Severity;
+    tier?: ResultTier;
+    endpoint?: string;
+    identityId?: string;
+    expected?: string;
+    observed?: string;
+    impact?: string;
+    reasoning?: string;
+    nextTest?: string;
+    remediation?: string;
+    verification?: VerificationStatus;
   },
 ): TestObservation {
   return {
     id: `${ctx.testCase.id}-${suffix}`,
     category: ctx.testCase.category,
+    caseId: ctx.testCase.id,
     title: fields.title,
     state: fields.state,
     confidence: fields.confidence,
     summary: fields.summary,
     guidance: fields.guidance,
+    severity: fields.severity,
+    tier: fields.tier,
+    endpoint: fields.endpoint ?? fields.req.url,
+    identityId: fields.identityId ?? fields.req.identityId,
+    expected: fields.expected,
+    observed: fields.observed,
+    impact: fields.impact,
+    reasoning: fields.reasoning,
+    nextTest: fields.nextTest ?? fields.guidance,
+    remediation: fields.remediation,
+    verification: fields.verification,
     evidence: makeEvidence(fields.req, fields.res, fields.detail, fields.baseline),
   };
+}
+
+function classificationsOf(ctx: AnalyzeContext): EndpointClassification[] | undefined {
+  return ctx.testCase.metadata?.classifications as EndpointClassification[] | undefined;
 }
 
 function contentType(res: ScopedHttpResult): string {
@@ -93,10 +126,18 @@ const securityHeaders: Analyzer = (ctx) => {
         title: `Security headers not observed (${missing.length})`,
         state: "Observation",
         confidence: "low",
-        summary: `Not observed: ${missing.map((m) => m.name).join(", ")}. Absence is contextual evidence, not a vulnerability; each gap is reported for manual review.`,
+        severity: "info",
+        tier: 3,
+        summary: `Not observed: ${missing.map((m) => m.name).join(", ")}. Security hardening observation, not a vulnerability; each gap is reported for manual review.`,
         detail: missing.map((m) => `${m.name}: not present — ${m.why}`).join("\n"),
+        expected: "Responses define the security headers the baseline policy requires.",
+        observed: `Header(s) absent: ${missing.map((m) => m.name).join(", ")}.`,
+        impact:
+          "Absent hardening headers widen browser-side attack surface but do not by themselves demonstrate an exploitable weakness.",
         req: base.req,
         res: base.res,
+        nextTest:
+          "Confirm whether a compensating proxy/CDN sets these headers and whether any consequence is demonstrable.",
       }),
     );
   }
@@ -106,13 +147,20 @@ const securityHeaders: Analyzer = (ctx) => {
   if ((server && /\d/.test(server)) || (poweredBy && /\d/.test(poweredBy))) {
     out.push(
       observation(ctx, "banner", {
-        title: "Version banner exposed",
-        state: "Observation",
+        title: "Technology banner exposed",
+        state: "Informational",
         confidence: "medium",
-        summary: `Server/technology banner reveals a version: ${[server, poweredBy].filter(Boolean).join(", ")}.`,
-        detail: "Version disclosure helps an attacker target known issues in that release.",
+        severity: "info",
+        tier: 3,
+        summary: `Banner reveals a component version: ${[server, poweredBy].filter(Boolean).join(", ")}. Informational only — version disclosure is not a vulnerability without demonstrated impact.`,
+        detail:
+          "Version disclosure can help an attacker target known issues in that release; confirm the release is still supported.",
+        expected: "Responses avoid advertising precise component versions.",
+        observed: `Banner: ${[server, poweredBy].filter(Boolean).join(", ")}.`,
+        impact: "Reconnaissance aid only.",
         req: base.req,
         res: base.res,
+        nextTest: "Check the disclosed version against the vendor's support lifecycle.",
       }),
     );
   }
@@ -362,9 +410,20 @@ const authAnon: Analyzer = (ctx) => {
   if (!authed || !anon) return [];
   if (!authed.res.ok || !anon.res.ok) return [];
 
+  const classes = classificationsOf(ctx);
+  /* Login/registration/reset flows and public pages are expected to answer
+     anonymous callers; comparing them here only creates noise. */
+  if (isAuthFlow(classes)) return [];
+
+  const sensitiveContext = classes?.some((c) =>
+    ["API", "RESOURCE_ACCESS", "PRIVILEGED", "ADMIN", "AUTHENTICATED"].includes(c),
+  );
+  if (!sensitiveContext) return [];
+
   if (isDenied(authed.res.status)) return [];
 
-  const similarity = bodySimilarity(authed.res.body, anon.res.body);
+  const diff = diffResponses(anon.res, authed.res);
+  const anonSubstantive = hasSubstantiveData(anon.res);
 
   if (isDenied(anon.res.status)) {
     return [
@@ -372,8 +431,12 @@ const authAnon: Analyzer = (ctx) => {
         title: "Authentication boundary enforced",
         state: "Not Reproducible",
         confidence: "medium",
+        severity: "info",
+        tier: 3,
         summary: `Anonymous access was refused (${anon.res.status}) while the authenticated request succeeded (${authed.res.status}).`,
         detail: `anonymous: ${describeResponse(anon.res)}\nauthenticated: ${describeResponse(authed.res)}`,
+        expected: "Protected endpoint denies unauthenticated access.",
+        observed: `Anonymous request answered ${anon.res.status}.`,
         req: anon.req,
         res: anon.res,
         baseline: authed.res,
@@ -381,19 +444,57 @@ const authAnon: Analyzer = (ctx) => {
     ];
   }
 
-  if (isSuccess(authed.res.status) && isSuccess(anon.res.status) && similarity > 0.9) {
+  if (!isSuccess(anon.res.status)) return [];
+
+  const substantive = hasSubstantiveData(authed.res);
+  const structuredGain =
+    diff.keysAdded.length > 0 || diff.sensitiveKeysAdded.length > 0;
+
+  if (substantive && (structuredGain || !anonSubstantive)) {
+    return [
+      observation(ctx, "anon-gap", {
+        title: "Authenticated response exposes data absent anonymously",
+        state: "Needs Verification",
+        confidence: "medium",
+        severity: "medium",
+        tier: 2,
+        summary: `The authenticated response to ${authed.req.url} contains substantive data${
+          structuredGain ? ` (new keys: ${[...diff.keysAdded, ...diff.sensitiveKeysAdded].slice(0, 6).join(", ")})` : ""
+        } that the anonymous response did not, without a clear denial. If this endpoint is not intentionally public, authentication may not be enforced.`,
+        detail: `anonymous: ${describeResponse(anon.res)}\nauthenticated: ${describeResponse(authed.res)}\nstructured gain: ${structuredGain}`,
+        expected: "An endpoint that returns private data should refuse anonymous callers.",
+        observed: `Anonymous request returned ${anon.res.status} with ${anonSubstantive ? "non-substantive" : "no"} private data.`,
+        impact:
+          "If the data is private, an unauthenticated caller can read it. Public endpoints make this expected.",
+        reasoning: "Compared the anonymous and authenticated responses structurally.",
+        req: anon.req,
+        res: anon.res,
+        baseline: authed.res,
+        guidance:
+          "Confirm the endpoint is meant to be private before treating this as a finding.",
+        nextTest:
+          "Request the same endpoint with no credentials in a fresh client and confirm whether private data is returned.",
+        remediation: "Enforce authentication server-side before returning private data.",
+      }),
+    ];
+  }
+
+  if (diff.similarity > 0.95) {
     return [
       observation(ctx, "public-equiv", {
         title: "Authenticated and anonymous responses match",
         state: "Observation",
         confidence: "low",
-        summary: `Anonymous and authenticated responses to ${anon.req.url} are ${(similarity * 100).toFixed(0)}% similar. This is expected for public pages; it only warrants review if this endpoint is meant to be private.`,
-        detail: `similarity: ${(similarity * 100).toFixed(0)}%\nanonymous: ${describeResponse(anon.res)}\nauthenticated: ${describeResponse(authed.res)}`,
+        severity: "info",
+        tier: 3,
+        summary: `Anonymous and authenticated responses to ${anon.req.url} are ${(diff.similarity * 100).toFixed(0)}% similar. Expected for public content; only review if this endpoint should be private.`,
+        detail: `similarity: ${(diff.similarity * 100).toFixed(0)}%\nanonymous: ${describeResponse(anon.res)}\nauthenticated: ${describeResponse(authed.res)}`,
+        expected: "Matching public content is normal.",
+        observed: "Both responses returned substantially the same content.",
+        impact: "None demonstrated.",
         req: anon.req,
         res: anon.res,
         baseline: authed.res,
-        guidance:
-          "Confirm whether the endpoint is intended to be public. Matching content is not itself evidence of a missing authentication check.",
       }),
     ];
   }
@@ -411,25 +512,10 @@ const authzCompare: Analyzer = (ctx) => {
   if (!a || !b) return [];
   if (!a.res.ok || !b.res.ok) return [];
 
-  const sim = bodySimilarity(a.res.body, b.res.body);
-  const structured = contentType(a.res).includes("json") || contentType(b.res).includes("json");
+  const classes = classificationsOf(ctx);
+  if (isAuthFlow(classes)) return [];
 
-  if (isSuccess(a.res.status) && isSuccess(b.res.status) && structured && sim > 0.98) {
-    return [
-      observation(ctx, "same-content", {
-        title: "Two identities receive identical structured content",
-        state: "Needs Verification",
-        confidence: "medium",
-        summary: `Identity A and identity B both received ${a.res.status} for ${a.req.url} with ${(sim * 100).toFixed(0)}% identical structured bodies. If this record is owned by A, B may be able to reach it — confirm ownership in the application.`,
-        detail: `identity A: ${describeResponse(a.res)}\nidentity B: ${describeResponse(b.res)}\nsimilarity: ${(sim * 100).toFixed(0)}%`,
-        req: b.req,
-        res: b.res,
-        baseline: a.res,
-        guidance:
-          "Confirm which account owns the object. Identical public records are expected; only identical private records imply a boundary gap.",
-      }),
-    ];
-  }
+  const diff = diffResponses(a.res, b.res);
 
   if (isDenied(a.res.status) && isSuccess(b.res.status)) {
     return [
@@ -437,8 +523,58 @@ const authzCompare: Analyzer = (ctx) => {
         title: "Identity B reaches a resource denied to A",
         state: "Needs Verification",
         confidence: "medium",
+        severity: "medium",
+        tier: 2,
         summary: `Identity A was denied (${a.res.status}) while identity B succeeded (${b.res.status}) for ${b.req.url}. Confirm whether B legitimately has broader access (role, ownership, or share).`,
         detail: `identity A: ${describeResponse(a.res)}\nidentity B: ${describeResponse(b.res)}`,
+        expected: "Access decisions should be consistent with each identity's permissions.",
+        observed: `A received ${a.res.status}; B received ${b.res.status}.`,
+        impact: "A privilege boundary may be inconsistent, but B may legitimately have broader rights.",
+        req: b.req,
+        res: b.res,
+        baseline: a.res,
+        identityId: b.req.identityId,
+      }),
+    ];
+  }
+
+  if (isSuccess(a.res.status) && isSuccess(b.res.status) && diff.structured && diff.similarity > 0.98) {
+    return [
+      observation(ctx, "same-content", {
+        title: "Two identities receive identical structured content",
+        state: "Needs Verification",
+        confidence: "medium",
+        severity: "medium",
+        tier: 2,
+        summary: `Identity A and identity B both received ${a.res.status} for ${a.req.url} with ${(diff.similarity * 100).toFixed(0)}% identical structured bodies. If this record is owned by A, B may be able to reach it.`,
+        detail: `identity A: ${describeResponse(a.res)}\nidentity B: ${describeResponse(b.res)}\nsimilarity: ${(diff.similarity * 100).toFixed(0)}%`,
+        expected: "Each identity should only see the records it is authorised to read.",
+        observed: "Both identities received materially identical structured records.",
+        impact:
+          "If the record is private, this is a horizontal authorization gap. Identical public records are expected.",
+        req: b.req,
+        res: b.res,
+        baseline: a.res,
+        identityId: b.req.identityId,
+        guidance:
+          "Confirm which account owns the object. Only identical private records imply a boundary gap.",
+        nextTest: "Confirm object ownership in the application, then repeat the cross-identity read.",
+      }),
+    ];
+  }
+
+  if (isDenied(b.res.status) && isSuccess(a.res.status)) {
+    return [
+      observation(ctx, "b-denied", {
+        title: "Identity B was refused the resource",
+        state: "Not Reproducible",
+        confidence: "medium",
+        severity: "info",
+        tier: 3,
+        summary: `Identity B received ${b.res.status} while identity A succeeded, which is consistent with object-level authorization.`,
+        detail: `identity A: ${describeResponse(a.res)}\nidentity B: ${describeResponse(b.res)}`,
+        expected: "Non-owning identities are refused.",
+        observed: `B received ${b.res.status}.`,
         req: b.req,
         res: b.res,
         baseline: a.res,
@@ -447,6 +583,153 @@ const authzCompare: Analyzer = (ctx) => {
   }
 
   return [];
+};
+
+/* ------------------------------------------------------------------ */
+/* BOLA / IDOR: does identity B receive identity A's data?             */
+/* ------------------------------------------------------------------ */
+
+const authzBola: Analyzer = (ctx) => {
+  const classes = classificationsOf(ctx);
+  if (!isResourceAccess(classes)) return [];
+
+  const a = pair(ctx, 0);
+  const b = pair(ctx, 1);
+  const anon = pair(ctx, 2);
+  if (!a || !b || !a.res.ok || !b.res.ok) return [];
+
+  const markersA = (ctx.testCase.metadata?.markersA as string[] | undefined) ?? [];
+  const leaked = markersPresent(b.res.body, markersA);
+  if (leaked.length === 0) return [];
+
+  if (!isSuccess(b.res.status) || !hasSubstantiveData(b.res)) return [];
+
+  const anonLeaksMarker = anon ? markersPresent(anon.res.body, markersA).length > 0 : false;
+  const anonProtected = anon
+    ? isDenied(anon.res.status) || !hasSubstantiveData(anon.res) || !anonLeaksMarker
+    : true;
+
+  if (!anonProtected) {
+    return [
+      observation(ctx, "bola-public", {
+        title: "Identity data appears in a publicly reachable response",
+        state: "Needs Verification",
+        confidence: "low",
+        severity: "low",
+        tier: 3,
+        summary: `Identity A's marker (${leaked.join(", ")}) appeared in identity B's response, but the same data was reachable anonymously. This is more likely intentional public data than an authorization gap.`,
+        detail: `markers: ${leaked.join(", ")}\nanonymous reachable: yes`,
+        expected: "Private records should not be reachable anonymously.",
+        observed: "The data is public.",
+        impact: "None demonstrated.",
+        req: b.req,
+        res: b.res,
+        baseline: a.res,
+        identityId: b.req.identityId,
+      }),
+    ];
+  }
+
+  const bShape = jsonShape(b.res.body);
+  return [
+    observation(ctx, "bola", {
+      title: "Potential broken object-level authorization",
+      state: "Potential Issue",
+      confidence: "high",
+      severity: "high",
+      tier: 1,
+      summary: `Identity B's request for ${b.req.url} returned identity A's data (${leaked.join(", ")}), while anonymous access to the same resource was refused. This is the observable shape of a horizontal authorization gap (IDOR/BOLA).`,
+      detail: `markers of A found in B's response: ${leaked.join(", ")}\nsensitive keys in B's response: ${bShape.sensitiveKeys.slice(0, 8).join(", ") || "(none)"}\nA: ${describeResponse(a.res)}\nB: ${describeResponse(b.res)}${anon ? `\nanonymous: ${describeResponse(anon.res)}` : ""}`,
+      expected: `Identity B should be refused (401/403) for a resource owned by identity A.`,
+      observed: `Identity B received ${b.res.status} containing identity A's data.`,
+      impact:
+        "Horizontal privilege escalation: one user can read another user's protected records through object-reference manipulation.",
+      reasoning:
+        "Identity markers owned by A appeared in B's response while anonymous access was refused, isolating the exposure to an authenticated cross-account read.",
+      req: b.req,
+      res: b.res,
+      baseline: a.res,
+      identityId: b.req.identityId,
+      guidance:
+        "Reproduce with a stable resource identifier and confirm the record belongs to A.",
+      nextTest:
+        "Repeat the cross-identity request; confirm the returned object's owner matches identity A.",
+      remediation:
+        "Enforce object-level authorization server-side on every record access, keyed to the authenticated subject.",
+    }),
+  ];
+};
+
+/* ------------------------------------------------------------------ */
+/* Vertical: can a lower-privileged identity reach admin functionality?*/
+/* ------------------------------------------------------------------ */
+
+const authzVertical: Analyzer = (ctx) => {
+  const classes = classificationsOf(ctx);
+  if (!classes?.some((c) => c === "ADMIN")) return [];
+
+  const privileged = pair(ctx, 0);
+  const lower = pair(ctx, 1);
+  if (!privileged || !lower) return [];
+  if (!privileged.res.ok || !lower.res.ok) return [];
+
+  const privilegedIdentity = ctx.identities.find((i) => i.id === privileged.req.identityId);
+  const lowerIdentity = ctx.identities.find((i) => i.id === lower.req.identityId);
+  if (!isPrivileged(privilegedIdentity) || isPrivileged(lowerIdentity)) return [];
+
+  const markersA = identityMarkers(privilegedIdentity);
+  const leaked = markersPresent(lower.res.body, markersA);
+
+  if (isDenied(lower.res.status)) {
+    return [
+      observation(ctx, "vertical-denied", {
+        title: "Administrative endpoint refused a lower-privileged identity",
+        state: "Not Reproducible",
+        confidence: "medium",
+        severity: "info",
+        tier: 3,
+        summary: `The lower-privileged identity received ${lower.res.status} for the administrative endpoint while the privileged identity succeeded.`,
+        detail: `privileged: ${describeResponse(privileged.res)}\nlower: ${describeResponse(lower.res)}`,
+        expected: "Administrative functionality is refused to non-privileged identities.",
+        observed: `Second identity received ${lower.res.status}.`,
+        req: lower.req,
+        res: lower.res,
+        baseline: privileged.res,
+        identityId: lower.req.identityId,
+      }),
+    ];
+  }
+
+  if (!isSuccess(lower.res.status) || !hasSubstantiveData(lower.res)) return [];
+
+  const strong = leaked.length > 0;
+  return [
+    observation(ctx, "vertical", {
+      title: "Non-privileged identity reached administrative functionality",
+      state: strong ? "Potential Issue" : "Needs Verification",
+      confidence: strong ? "high" : "medium",
+      severity: strong ? "high" : "medium",
+      tier: 1,
+      summary: `A non-privileged identity received ${lower.res.status} from the administrative endpoint ${lower.req.url}${strong ? ` including privileged data (${leaked.join(", ")})` : ""}.`,
+      detail: `privileged: ${describeResponse(privileged.res)}\nlower: ${describeResponse(lower.res)}\nprivileged markers in lower response: ${leaked.join(", ") || "(none)"}`,
+      expected: "Administrative functionality should require an elevated role.",
+      observed: `Lower-privileged identity received substantive administrative content.`,
+      impact:
+        "Vertical privilege escalation: a normal user can invoke functionality reserved for administrators.",
+      reasoning: strong
+        ? "The lower-privileged response contained data attributable to the privileged identity."
+        : "The lower-privileged identity reached an administrative endpoint with substantive content; role enforcement is unconfirmed.",
+      req: lower.req,
+      res: lower.res,
+      baseline: privileged.res,
+      identityId: lower.req.identityId,
+      guidance:
+        "Confirm the endpoint is genuinely administrative and that no role check is missing.",
+      nextTest:
+        "Attempt a state-changing administrative action with the lower-privileged identity (only where safe and authorised).",
+      remediation: "Enforce function-level (role) authorization server-side.",
+    }),
+  ];
 };
 
 /* ------------------------------------------------------------------ */
@@ -479,12 +762,20 @@ const inputValidation: Analyzer = (ctx) => {
           title: "Input appears to be evaluated",
           state: "Potential Issue",
           confidence: "high",
+          severity: "high",
+          tier: 2,
           summary: `Sending ${meta.value} to "${ctx.testCase.title}" returned the evaluated result ${meta.evaluated}.`,
           detail: `probe intent: ${meta.intent}\nbaseline status: ${base.res.status}, test status: ${res.status}`,
+          expected: "User input is treated as data, not evaluated as an expression.",
+          observed: `The probe ${meta.value} produced the evaluated output ${meta.evaluated}.`,
+          impact:
+            "Server-side evaluation of user input can lead to code/template injection depending on the engine.",
           req,
           res,
           baseline: base.res,
           guidance: "Confirm the evaluation happens server-side and is not echoed from a client template.",
+          nextTest: "Vary the expression (e.g. a second arithmetic probe) and confirm the result changes accordingly.",
+          remediation: "Never evaluate user input; use safe templating and strict allowlists.",
         }),
       );
       continue;
@@ -496,12 +787,21 @@ const inputValidation: Analyzer = (ctx) => {
           title: "Probe triggered a server error",
           state: "Potential Issue",
           confidence: "medium",
+          severity: "medium",
+          tier: 2,
           summary: `A controlled "${meta.intent}" probe changed the status from ${base.res.status} to ${res.status}.`,
           detail: `value: ${meta.value.slice(0, 80)}\nbaseline: ${describeResponse(base.res)}\ntest: ${describeResponse(res)}`,
+          expected: "Malformed input is rejected cleanly (4xx) without a server fault.",
+          observed: `The probe produced ${res.status}.`,
+          impact:
+            "Unhandled input reaching a fault path can expose error internals or indicate missing validation.",
+          reasoning: "A single controlled input changed a healthy endpoint into a server error.",
           req,
           res,
           baseline: base.res,
           guidance: "Confirm the input is validated and that errors do not leak internals.",
+          nextTest: "Reproduce with a minimally different value and inspect the error body for internals.",
+          remediation: "Validate and normalise input server-side; return 4xx for rejected input.",
         }),
       );
       continue;
@@ -514,11 +814,17 @@ const inputValidation: Analyzer = (ctx) => {
           title: "Error signature in response",
           state: "Needs Verification",
           confidence: "medium",
+          severity: "low",
+          tier: 3,
           summary: `Response contained the error signature "${signature}" for the "${meta.intent}" probe.`,
           detail: `value: ${meta.value.slice(0, 80)}\nbaseline signature: ${baselineError ?? "(none)"}`,
+          expected: "Errors are handled without exposing internal diagnostics.",
+          observed: `Diagnostic signature "${signature}" appeared in the response.`,
+          impact: "Information disclosure only if the signature reveals internals of security value.",
           req,
           res,
           baseline: base.res,
+          guidance: "Inspect the error body; a generic error page is not a finding.",
         }),
       );
       continue;
@@ -634,6 +940,8 @@ const registry: Record<string, Analyzer> = {
   "csrf-active": csrfActive,
   "auth-anon": authAnon,
   "authz-compare": authzCompare,
+  "authz-bola": authzBola,
+  "authz-vertical": authzVertical,
   "input-validation": inputValidation,
   "upload-static": uploadStatic,
   "upload-active": uploadActive,

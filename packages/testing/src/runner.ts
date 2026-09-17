@@ -4,6 +4,8 @@ import { getAnalyzer } from "./analyzers";
 import { buildCases } from "./planner";
 import { buildSurface, type DiscoveryPage } from "./surface";
 import { runWorkflow } from "./workflow";
+import { dedupeObservations, prioritizeObservations } from "./prioritize";
+import { enrichObservationsWithAi } from "./ai";
 import type {
   AutomatedRequest,
   Progress,
@@ -11,11 +13,14 @@ import type {
   RunInput,
   RunOutcome,
   SkippedCategory,
+  Surface,
   TestCase,
   TestObservation,
 } from "./types";
 
 const MAX_DISCOVERY_PAGES = 3;
+/** Maximum number of potential issues to independently re-verify. */
+const MAX_VERIFICATIONS = 12;
 
 function failedResult(url: string, message: string): ScopedHttpResult {
   return {
@@ -181,16 +186,38 @@ export async function runAutomatedTests(
   }
 
   report({
-    phase: "done",
-    message: `Completed ${completedCases}/${total} test groups`,
+    phase: "analyze",
+    message: "Verifying and prioritising results",
     completed: completedCases,
     total,
     observations: observations.length,
   });
 
+  let results = dedupeObservations(observations);
+  results = await verifyObservations(results, plan.cases, surface, input, budget, () => {
+    budgetExhausted = true;
+    truncated = true;
+  });
+  if (input.ai?.apiKey) {
+    results = await enrichObservationsWithAi(results, {
+      apiKey: input.ai.apiKey,
+      model: input.ai.model,
+      max: input.ai.max,
+    });
+  }
+  results = prioritizeObservations(results);
+
+  report({
+    phase: "done",
+    message: `Completed ${completedCases}/${total} test groups`,
+    completed: completedCases,
+    total,
+    observations: results.length,
+  });
+
   const counters = budget.counters();
   return {
-    observations: sortObservations(observations),
+    observations: results,
     surface,
     stats: {
       requests: counters.requests,
@@ -201,6 +228,101 @@ export async function runAutomatedTests(
     },
     skipped,
   };
+}
+
+/**
+ * Independently re-run the requests behind each serious result. A result only
+ * becomes `Verified Security Issue` when the same condition reproduces from a
+ * fresh execution. Mutating test cases are never re-run.
+ */
+async function verifyObservations(
+  observations: TestObservation[],
+  cases: TestCase[],
+  surface: Surface,
+  input: RunInput,
+  budget: ReturnType<typeof createBudget>,
+  onExhausted: () => void,
+): Promise<TestObservation[]> {
+  const byId = new Map(cases.map((testCase) => [testCase.id, testCase]));
+  const out: TestObservation[] = [];
+  let attempts = 0;
+
+  for (const observation of observations) {
+    if (observation.state !== "Potential Issue") {
+      out.push(observation);
+      continue;
+    }
+    const testCase = observation.caseId ? byId.get(observation.caseId) : undefined;
+    if (
+      !testCase ||
+      testCase.requests.some((request) => request.mutating) ||
+      attempts >= MAX_VERIFICATIONS ||
+      budget.exhausted()
+    ) {
+      out.push({
+        ...observation,
+        verification: observation.verification ?? "needs-verification",
+        verificationDetail:
+          observation.verificationDetail ??
+          (testCase?.requests.some((r) => r.mutating)
+            ? "Not re-run automatically: the check uses a state-changing request."
+            : "Not re-run: verification budget reached."),
+      });
+      continue;
+    }
+
+    attempts += 1;
+    try {
+      const results = await executeCase(testCase, budget, onExhausted);
+      const analyzer = getAnalyzer(testCase.analyzer);
+      const produced = analyzer
+        ? analyzer({
+            testCase,
+            surface,
+            results,
+            identities: input.identities,
+            activeTests: input.budget.activeTests,
+          })
+        : [];
+      const reproduced = produced.some(
+        (candidate) =>
+          candidate.id === observation.id &&
+          (candidate.state === "Potential Issue" || candidate.state === "Verified Security Issue"),
+      );
+      out.push(
+        reproduced
+          ? {
+              ...observation,
+              state: "Verified Security Issue",
+              confidence: "high",
+              severity: observation.severity ?? "high",
+              verification: "reproduced",
+              verificationDetail:
+                "Independently re-executed the same requests and reproduced the condition.",
+            }
+          : {
+              ...observation,
+              state: "Needs Verification",
+              verification: "unreproduced",
+              verificationDetail:
+                "Re-execution did not reproduce the condition; treat as unconfirmed.",
+            },
+      );
+    } catch (error) {
+      if (error instanceof BudgetExhausted) {
+        onExhausted();
+        out.push(observation);
+        break;
+      }
+      out.push({
+        ...observation,
+        verification: "unreproduced",
+        verificationDetail: "Verification attempt failed to complete.",
+      });
+    }
+  }
+
+  return out;
 }
 
 async function executeCase(
@@ -224,20 +346,6 @@ async function executeCase(
     }
   }
   return results;
-}
-
-const STATE_WEIGHT: Record<string, number> = {
-  "Potential Issue": 4,
-  "Needs Verification": 3,
-  Observation: 2,
-  Verified: 1,
-  "Not Reproducible": 0,
-};
-
-function sortObservations(observations: TestObservation[]): TestObservation[] {
-  return [...observations].sort(
-    (a, b) => (STATE_WEIGHT[b.state] ?? 0) - (STATE_WEIGHT[a.state] ?? 0),
-  );
 }
 
 export type { AutomatedRequest };

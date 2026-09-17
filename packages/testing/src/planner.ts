@@ -12,6 +12,8 @@ import type {
 import { INPUT_PROBES, BENIGN_MARKER, type InputProbe } from "./payloads";
 import { buildMultipart, formUrlEncoded } from "./multipart";
 import { generateOpenApiCases } from "./openapi";
+import { classifyEndpoint, isAuthFlow, isResourceAccess } from "./classify";
+import { identityMarkers, isPrivileged } from "./identity";
 
 export const PROBE_ORIGIN = "https://webstrike-probe.invalid";
 
@@ -127,8 +129,12 @@ export function buildCases(surface: Surface, options: PlanOptions): PlanResult {
     return request;
   };
 
-  const endpointsWithParams = surface.endpoints.filter((e) => e.params.length > 0);
-  const nonFormEndpoints = surface.endpoints.filter((e) => e.source !== "form");
+  const classified = surface.endpoints.map((endpoint) => ({
+    ...endpoint,
+    classifications: endpoint.classifications ?? classifyEndpoint(endpoint),
+  }));
+  const endpointsWithParams = classified.filter((e) => e.params.length > 0);
+  const nonFormEndpoints = classified.filter((e) => e.source !== "form");
 
   /* security headers */
   if (wants.has("security-headers")) {
@@ -235,13 +241,17 @@ export function buildCases(surface: Surface, options: PlanOptions): PlanResult {
     if (!identityA) {
       skipped.push({ category: "authentication", reason: "provide at least one identity" });
     } else {
-      for (const endpoint of nonFormEndpoints.slice(0, caps.authEndpoints)) {
+      const candidates = nonFormEndpoints
+        .filter((endpoint) => !isAuthFlow(endpoint.classifications))
+        .slice(0, caps.authEndpoints);
+      for (const endpoint of candidates) {
         const caseId = nextId("auth");
         cases.push({
           id: caseId,
           category: "authentication",
           title: `Authenticated vs anonymous: ${endpoint.url}`,
           analyzer: "auth-anon",
+          metadata: { endpoint: endpoint.url, classifications: endpoint.classifications },
           requests: [
             withIdentity(
               makeRequest(caseId, 0, `authenticated (${identityA.label})`, "GET", endpoint.url),
@@ -259,14 +269,31 @@ export function buildCases(surface: Surface, options: PlanOptions): PlanResult {
     if (!identityA || !identityB) {
       skipped.push({ category: "authorization", reason: "provide two identities to compare" });
     } else {
-      for (const endpoint of nonFormEndpoints.slice(0, caps.authzEndpoints)) {
+      const candidates = nonFormEndpoints
+        .filter((endpoint) => !isAuthFlow(endpoint.classifications))
+        .slice(0, caps.authzEndpoints);
+      const markersA = identityMarkers(identityA);
+      const markersB = identityMarkers(identityB);
+      const privileged = [identityA, identityB].find((i) => isPrivileged(i));
+      const lower = [identityA, identityB].find((i) => !isPrivileged(i));
+
+      for (const endpoint of candidates) {
+        const baseMeta = {
+          endpoint: endpoint.url,
+          classifications: endpoint.classifications,
+          identityA: identityA.label,
+          identityB: identityB.label,
+          markersA,
+          markersB,
+        };
+
         const caseId = nextId("authz");
         cases.push({
           id: caseId,
           category: "authorization",
           title: `Identity comparison: ${endpoint.url}`,
           analyzer: "authz-compare",
-          metadata: { identityA: identityA.label, identityB: identityB.label },
+          metadata: baseMeta,
           requests: [
             withIdentity(
               makeRequest(caseId, 0, `identity A (${identityA.label})`, "GET", endpoint.url),
@@ -278,6 +305,49 @@ export function buildCases(surface: Surface, options: PlanOptions): PlanResult {
             ),
           ],
         });
+
+        if (isResourceAccess(endpoint.classifications)) {
+          const bolaId = nextId("bola");
+          cases.push({
+            id: bolaId,
+            category: "authorization",
+            title: `Cross-identity object access: ${endpoint.url}`,
+            analyzer: "authz-bola",
+            metadata: baseMeta,
+            requests: [
+              withIdentity(
+                makeRequest(bolaId, 0, `identity A (${identityA.label})`, "GET", endpoint.url),
+                identityA,
+              ),
+              withIdentity(
+                makeRequest(bolaId, 1, `identity B (${identityB.label})`, "GET", endpoint.url),
+                identityB,
+              ),
+              makeRequest(bolaId, 2, "anonymous", "GET", endpoint.url),
+            ],
+          });
+        }
+
+        if (privileged && lower && endpoint.classifications?.includes("ADMIN")) {
+          const verticalId = nextId("vertical");
+          cases.push({
+            id: verticalId,
+            category: "authorization",
+            title: `Privilege boundary: ${endpoint.url}`,
+            analyzer: "authz-vertical",
+            metadata: baseMeta,
+            requests: [
+              withIdentity(
+                makeRequest(verticalId, 0, `privileged (${privileged.label})`, "GET", endpoint.url),
+                privileged,
+              ),
+              withIdentity(
+                makeRequest(verticalId, 1, `lower (${lower.label})`, "GET", endpoint.url),
+                lower,
+              ),
+            ],
+          });
+        }
       }
     }
   }

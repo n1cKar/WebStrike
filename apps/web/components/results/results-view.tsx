@@ -24,9 +24,10 @@ import { redactHeaderValue } from "@/lib/http/format";
  */
 export const RESULT_STATES = [
   "Observation",
+  "Informational",
   "Potential Issue",
   "Needs Verification",
-  "Verified",
+  "Verified Security Issue",
   "Not Reproducible",
 ] as const;
 
@@ -135,7 +136,7 @@ export function ResultsView() {
           <Badge
             key={state}
             variant={
-              state === "Verified"
+              state === "Verified Security Issue"
                 ? "success"
                 : state === "Potential Issue"
                   ? "warning"

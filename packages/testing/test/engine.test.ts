@@ -43,6 +43,7 @@ const BASE_HTML = `<!doctype html><html><body>
   <a href="/admin">admin</a>
   <a href="/api/items?id=1">items</a>
   <a href="/api/account">account</a>
+  <a href="/api/orders/1">order</a>
   <form method="post" action="/login">
     <input type="hidden" name="csrf_token" value="tok-123">
     <input type="text" name="username" value="alice">
@@ -93,9 +94,38 @@ const fakeSite: RequestExecutor = async (request: AutomatedRequest) => {
   }
 
   if (path === "/api/account") {
+    const authed =
+      request.cookies.some((c) => c.name === "session") ||
+      request.headers.some(
+        (h) => h.name.toLowerCase() === "cookie" && h.value.includes("session="),
+      );
+    if (!authed) {
+      return result(request.url, 401, JSON.stringify({ error: "unauthorized" }), {
+        headers: { "content-type": "application/json" },
+      });
+    }
     return result(request.url, 200, JSON.stringify({ owner: "alice", balance: 100 }), {
       headers: { "content-type": "application/json" },
     });
+  }
+
+  if (path === "/api/orders/1") {
+    const authed =
+      request.cookies.some((c) => c.name === "session") ||
+      request.headers.some(
+        (h) => h.name.toLowerCase() === "cookie" && h.value.includes("session="),
+      );
+    if (!authed) {
+      return result(request.url, 401, JSON.stringify({ error: "unauthorized" }), {
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return result(
+      request.url,
+      200,
+      JSON.stringify({ orderId: 1, owner: "Alice", total: 42, email: "alice@target.test" }),
+      { headers: { "content-type": "application/json" } },
+    );
   }
 
   if (path === "/api/items") {
@@ -269,12 +299,16 @@ describe("runAutomatedTests", () => {
 
     const titles = outcome.observations.map((o) => o.title).join(" | ");
     expect(titles).toMatch(/Security headers not observed/);
-    expect(titles).toMatch(/Version banner/);
+    expect(titles).toMatch(/Technology banner/);
     expect(titles).toMatch(/CORS|origin reflected|Arbitrary origin/i);
     expect(titles).toMatch(/authentication|anonymous responses match/i);
     expect(titles).toMatch(/matching content|Two identities/i);
     expect(titles).toMatch(/server error|evaluated|reflected/i);
-    expect(outcome.observations.some((o) => o.state === "Potential Issue")).toBe(true);
+    expect(
+      outcome.observations.some(
+        (o) => o.state === "Potential Issue" || o.state === "Verified Security Issue",
+      ),
+    ).toBe(true);
     expect(outcome.stats.requests).toBeGreaterThan(5);
     expect(outcome.stats.truncated).toBe(false);
   });

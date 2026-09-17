@@ -105,6 +105,9 @@ export async function POST(request: Request) {
             workflow: parsed.data.workflow,
             openapi: parsed.data.openapi,
             seedPaths: parsed.data.seedPaths,
+            ai: process.env.GROQ_API_KEY
+              ? { apiKey: process.env.GROQ_API_KEY, model: process.env.GROQ_MODEL }
+              : undefined,
             onProgress: (progress) => send({ type: "progress", progress }),
           },
           executor,

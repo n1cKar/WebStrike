@@ -39,10 +39,11 @@ const PROFILE_HELP: Record<Profile, string> = {
 };
 
 const STATE_ORDER: TestObservation["state"][] = [
+  "Verified Security Issue",
   "Potential Issue",
   "Needs Verification",
   "Observation",
-  "Verified",
+  "Informational",
   "Not Reproducible",
 ];
 
