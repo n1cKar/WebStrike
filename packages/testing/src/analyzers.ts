@@ -154,14 +154,17 @@ const cors: Analyzer = (ctx) => {
   const reflectsProbe = acao === probeOrigin;
   const wildcard = acao === "*";
   const credentials = acac === "true";
+  const carriesCredentials =
+    probe.req.cookies.length > 0 ||
+    probe.req.headers.some((h) => /^(cookie|authorization)$/i.test(h.name));
 
-  if (reflectsProbe && credentials) {
+  if (reflectsProbe && credentials && carriesCredentials) {
     return [
       observation(ctx, "reflect-credentials", {
         title: "Arbitrary origin reflected with credentials",
         state: "Potential Issue",
         confidence: "high",
-        summary: `The response reflected the request Origin "${probeOrigin}" in Access-Control-Allow-Origin while allowing credentials. Any site could read authenticated responses if the session is cookie-based.`,
+        summary: `The response reflected the request Origin "${probeOrigin}" in Access-Control-Allow-Origin while allowing credentials, and the probe carried a session credential. A malicious site could read authenticated responses if the session is cookie-based.`,
         detail: `Access-Control-Allow-Origin: ${acao}\nAccess-Control-Allow-Credentials: ${acac}\nBaseline ACAO: ${baseline.res.headers["access-control-allow-origin"] ?? "(none)"}`,
         req: probe.req,
         res: probe.res,
@@ -172,20 +175,37 @@ const cors: Analyzer = (ctx) => {
     ];
   }
 
+  if (reflectsProbe && credentials) {
+    return [
+      observation(ctx, "reflect-credentials-unauthenticated", {
+        title: "Origin reflected with credentials flag (unauthenticated probe)",
+        state: "Needs Verification",
+        confidence: "low",
+        summary: `Access-Control-Allow-Origin echoed "${probeOrigin}" with Allow-Credentials: true. The probe was unauthenticated, so browser impact depends on whether credentialed requests are accepted.`,
+        detail: `Access-Control-Allow-Origin: ${acao}\nAccess-Control-Allow-Credentials: ${acac}`,
+        req: probe.req,
+        res: probe.res,
+        baseline: baseline.res,
+        guidance:
+          "Repeat with a real identity; only reflected origins plus accepted credentials constitute a cross-origin read risk.",
+      }),
+    ];
+  }
+
   if (reflectsProbe) {
     const changed = changedHeaders(baseline.res.headers, probe.res.headers);
     return [
       observation(ctx, "reflect", {
         title: "Request origin reflected in CORS policy",
         state: "Needs Verification",
-        confidence: "medium",
-        summary: `Access-Control-Allow-Origin echoed the probe Origin "${probeOrigin}". Confirm whether the allowed origin list is enforced or mirrored.`,
+        confidence: "low",
+        summary: `Access-Control-Allow-Origin echoed the probe Origin "${probeOrigin}". Reflection without Allow-Credentials has limited browser impact; confirm whether the allowed origin list is enforced.`,
         detail: `Access-Control-Allow-Origin: ${acao}; changed headers vs baseline: ${changed.join(", ") || "(none)"}`,
         req: probe.req,
         res: probe.res,
         baseline: baseline.res,
         guidance:
-          "Compare with an Origin the application should reject. Reflection without credentials has limited impact but is still worth confirming.",
+          "Compare with an Origin the application should reject. Reflection without credentials is usually benign.",
       }),
     ];
   }
@@ -364,14 +384,16 @@ const authAnon: Analyzer = (ctx) => {
   if (isSuccess(authed.res.status) && isSuccess(anon.res.status) && similarity > 0.9) {
     return [
       observation(ctx, "public-equiv", {
-        title: "Resource reachable anonymously with matching content",
-        state: "Needs Verification",
-        confidence: "medium",
-        summary: `Anonymous and authenticated responses to ${anon.req.url} are ${(similarity * 100).toFixed(0)}% similar. If this endpoint is meant to be private, authentication is not enforced; if it is public, this is expected.`,
+        title: "Authenticated and anonymous responses match",
+        state: "Observation",
+        confidence: "low",
+        summary: `Anonymous and authenticated responses to ${anon.req.url} are ${(similarity * 100).toFixed(0)}% similar. This is expected for public pages; it only warrants review if this endpoint is meant to be private.`,
         detail: `similarity: ${(similarity * 100).toFixed(0)}%\nanonymous: ${describeResponse(anon.res)}\nauthenticated: ${describeResponse(authed.res)}`,
         req: anon.req,
         res: anon.res,
         baseline: authed.res,
+        guidance:
+          "Confirm whether the endpoint is intended to be public. Matching content is not itself evidence of a missing authentication check.",
       }),
     ];
   }
@@ -390,20 +412,21 @@ const authzCompare: Analyzer = (ctx) => {
   if (!a.res.ok || !b.res.ok) return [];
 
   const sim = bodySimilarity(a.res.body, b.res.body);
+  const structured = contentType(a.res).includes("json") || contentType(b.res).includes("json");
 
-  if (isSuccess(a.res.status) && isSuccess(b.res.status) && sim > 0.9) {
+  if (isSuccess(a.res.status) && isSuccess(b.res.status) && structured && sim > 0.98) {
     return [
       observation(ctx, "same-content", {
-        title: "Two identities receive matching content",
+        title: "Two identities receive identical structured content",
         state: "Needs Verification",
         confidence: "medium",
-        summary: `Identity A and identity B both received ${a.res.status} for ${a.req.url} with ${(sim * 100).toFixed(0)}% similar bodies. If this resource is owned by A, B may be able to reach it — confirm ownership in the application.`,
+        summary: `Identity A and identity B both received ${a.res.status} for ${a.req.url} with ${(sim * 100).toFixed(0)}% identical structured bodies. If this record is owned by A, B may be able to reach it — confirm ownership in the application.`,
         detail: `identity A: ${describeResponse(a.res)}\nidentity B: ${describeResponse(b.res)}\nsimilarity: ${(sim * 100).toFixed(0)}%`,
         req: b.req,
         res: b.res,
         baseline: a.res,
         guidance:
-          "Confirm which account owns the object. Identical public content is expected; only identical private content implies a boundary gap.",
+          "Confirm which account owns the object. Identical public records are expected; only identical private records imply a boundary gap.",
       }),
     ];
   }
@@ -414,23 +437,8 @@ const authzCompare: Analyzer = (ctx) => {
         title: "Identity B reaches a resource denied to A",
         state: "Needs Verification",
         confidence: "medium",
-        summary: `Identity A was denied (${a.res.status}) while identity B succeeded (${b.res.status}) for ${b.req.url}. Confirm whether B legitimately has broader access.`,
+        summary: `Identity A was denied (${a.res.status}) while identity B succeeded (${b.res.status}) for ${b.req.url}. Confirm whether B legitimately has broader access (role, ownership, or share).`,
         detail: `identity A: ${describeResponse(a.res)}\nidentity B: ${describeResponse(b.res)}`,
-        req: b.req,
-        res: b.res,
-        baseline: a.res,
-      }),
-    ];
-  }
-
-  if (sim > 0.5 && sim <= 0.9 && isSuccess(a.res.status) && isSuccess(b.res.status)) {
-    return [
-      observation(ctx, "partial-overlap", {
-        title: "Partially overlapping content across identities",
-        state: "Observation",
-        confidence: "low",
-        summary: `Identity A and B responses are ${(sim * 100).toFixed(0)}% similar; a shared shell with different records is normal.`,
-        detail: `similarity: ${(sim * 100).toFixed(0)}%`,
         req: b.req,
         res: b.res,
         baseline: a.res,
@@ -520,14 +528,15 @@ const inputValidation: Analyzer = (ctx) => {
       out.push(
         observation(ctx, `reflect-${meta.probeId}`, {
           title: "Input reflected without encoding",
-          state: "Potential Issue",
-          confidence: "medium",
+          state: "Needs Verification",
+          confidence: "low",
           summary: `The ${meta.intent} probe was reflected into HTML unencoded. Reflection alone is not XSS; it needs a context breakout to be exploitable.`,
           detail: `value: ${meta.value.slice(0, 80)}\nreflection is raw in an HTML response`,
           req,
           res,
           baseline: base.res,
-          guidance: "Inspect the reflection context before concluding; verify output encoding.",
+          guidance:
+            "Inspect the reflection context before concluding; verify output encoding rather than assuming exploitability.",
         }),
       );
     }

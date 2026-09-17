@@ -271,7 +271,7 @@ describe("runAutomatedTests", () => {
     expect(titles).toMatch(/Security headers not observed/);
     expect(titles).toMatch(/Version banner/);
     expect(titles).toMatch(/CORS|origin reflected|Arbitrary origin/i);
-    expect(titles).toMatch(/authentication|anonymously/i);
+    expect(titles).toMatch(/authentication|anonymous responses match/i);
     expect(titles).toMatch(/matching content|Two identities/i);
     expect(titles).toMatch(/server error|evaluated|reflected/i);
     expect(outcome.observations.some((o) => o.state === "Potential Issue")).toBe(true);

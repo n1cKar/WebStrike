@@ -2,9 +2,11 @@ import { NextResponse, type NextRequest } from "next/server";
 import { AUTH_COOKIE, verifyAuthToken } from "@/lib/auth/session";
 
 /**
- * Edge-level gate. This is a convenience redirect; the authoritative
- * authentication check happens server-side in the authenticated layout and in
- * every API route handler.
+ * Edge-level convenience gate. The authoritative check happens server-side in
+ * the app layout and in every API route handler.
+ *
+ * When REQUIRE_AUTH is not "true" the app runs in guest mode: protected pages
+ * are reachable without an account and auth pages bounce straight to the app.
  */
 const PROTECTED_PREFIXES = [
   "/dashboard",
@@ -21,6 +23,8 @@ const AUTH_PAGES = ["/login", "/register"];
 
 export async function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;
+  const authRequiredAtEdge = process.env.REQUIRE_AUTH === "true";
+
   const isProtected = PROTECTED_PREFIXES.some(
     (prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`),
   );
@@ -31,14 +35,14 @@ export async function proxy(request: NextRequest) {
   const token = request.cookies.get(AUTH_COOKIE)?.value;
   const user = token ? await verifyAuthToken(token) : null;
 
-  if (isProtected && !user) {
+  if (isProtected && authRequiredAtEdge && !user) {
     const url = request.nextUrl.clone();
     url.pathname = "/login";
     url.search = "";
     return NextResponse.redirect(url);
   }
 
-  if (isAuthPage && user) {
+  if (isAuthPage && (user || !authRequiredAtEdge)) {
     const url = request.nextUrl.clone();
     url.pathname = "/dashboard";
     url.search = "";

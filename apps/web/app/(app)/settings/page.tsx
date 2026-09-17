@@ -3,17 +3,18 @@ import { Database, HardDrive, KeyRound, ShieldCheck, Trash2 } from "lucide-react
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { SignOutButton } from "@/components/auth/sign-out-button";
-import { getCurrentUser } from "@/lib/auth/current-user";
+import { getActor } from "@/lib/auth/actor";
 import { getUserRepository } from "@/lib/auth/user-repository";
 
 export const metadata: Metadata = { title: "Settings" };
 
 export default async function SettingsPage() {
-  const user = await getCurrentUser();
+  const actor = await getActor();
   const repo = getUserRepository();
   const secretConfigured = Boolean(
     process.env.AUTH_SECRET && process.env.AUTH_SECRET.length >= 32,
   );
+  const authRequired = process.env.REQUIRE_AUTH === "true";
 
   return (
     <div className="mx-auto max-w-3xl space-y-4 p-4 sm:p-6">
@@ -21,17 +22,32 @@ export default async function SettingsPage() {
 
       <Card>
         <CardHeader>
-          <CardTitle>Account</CardTitle>
+          <CardTitle>Access</CardTitle>
         </CardHeader>
         <CardContent className="space-y-3 text-sm">
           <div className="flex items-center justify-between">
-            <span className="text-muted-foreground">Email</span>
-            <span className="mono">{user?.email ?? "—"}</span>
+            <span className="text-muted-foreground">Mode</span>
+            <Badge variant={authRequired ? "info" : "success"}>
+              {authRequired ? "account required" : "guest access (no login)"}
+            </Badge>
           </div>
           <div className="flex items-center justify-between">
-            <span className="text-muted-foreground">Sign out everywhere</span>
-            <SignOutButton />
+            <span className="text-muted-foreground">Identity</span>
+            <span className="mono">{actor?.email ?? "—"}</span>
           </div>
+          {actor && !actor.guest && (
+            <div className="flex items-center justify-between">
+              <span className="text-muted-foreground">Sign out everywhere</span>
+              <SignOutButton />
+            </div>
+          )}
+          {!authRequired && (
+            <p className="rounded-md border border-border bg-panel-2/40 p-3 text-xs text-muted-foreground">
+              WebStrike is running in guest mode. Set <span className="mono">REQUIRE_AUTH=true</span>{" "}
+              to require sign-in again. Scope validation, SSRF protection and rate
+              limits are always enforced.
+            </p>
+          )}
         </CardContent>
       </Card>
 

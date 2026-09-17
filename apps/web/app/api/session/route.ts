@@ -2,9 +2,11 @@ import { cookies } from "next/headers";
 import { createSessionSchema } from "@webstrike/validation";
 import { checkCsrf } from "@/lib/api/csrf";
 import { jsonError, jsonOk, readJson, zodErrorResponse } from "@/lib/api/responses";
-import { getCurrentUser } from "@/lib/auth/current-user";
+import { getActor } from "@/lib/auth/actor";
 import { audit } from "@/lib/logging/audit";
 import { buildScope, deriveDomainsFromTarget, selfCheckTarget } from "@/lib/scope";
+import { actorRateKey } from "@/lib/security/client-key";
+import { checkRateLimit } from "@/lib/security/limits";
 import {
   TESTING_SESSION_COOKIE,
   createTestingSessionToken,
@@ -17,16 +19,19 @@ import type { TestingSession } from "@webstrike/types";
 
 export const runtime = "nodejs";
 
+const SESSION_RATE_LIMIT = 20;
+const SESSION_RATE_WINDOW_MS = 60_000;
+
 export async function GET() {
-  const user = await getCurrentUser();
-  if (!user) return jsonError(401, "UNAUTHENTICATED", "sign in required");
+  const actor = await getActor();
+  if (!actor) return jsonError(401, "UNAUTHENTICATED", "sign in required");
 
   const store = await cookies();
   const token = store.get(TESTING_SESSION_COOKIE)?.value;
   if (!token) return jsonOk({ session: null });
 
   const session = await readTestingSessionToken(token);
-  if (!session || session.ownerId !== user.sub) {
+  if (!session || session.ownerId !== actor.id) {
     return jsonOk({ session: null });
   }
   return jsonOk({ session: withDerivedStatus(session) });
@@ -36,8 +41,18 @@ export async function POST(request: Request) {
   const csrf = checkCsrf(request);
   if (!csrf.ok) return jsonError(403, "CSRF", csrf.reason ?? "request refused");
 
-  const user = await getCurrentUser();
-  if (!user) return jsonError(401, "UNAUTHENTICATED", "sign in required");
+  const actor = await getActor();
+  if (!actor) return jsonError(401, "UNAUTHENTICATED", "sign in required");
+
+  const rate = checkRateLimit(
+    `session:${actorRateKey(actor, request)}`,
+    SESSION_RATE_LIMIT,
+    SESSION_RATE_WINDOW_MS,
+  );
+  if (!rate.ok) {
+    audit({ event: "security.refuse", actor: actor.email, outcome: "deny", reason: "rate limit" });
+    return jsonError(429, "RATE_LIMITED", "too many sessions created — retry shortly");
+  }
 
   const body = await readJson(request);
   const parsed = createSessionSchema.safeParse(body);
@@ -63,7 +78,7 @@ export async function POST(request: Request) {
 
   const self = selfCheckTarget(parsed.data.targetUrl, scope);
   if (!self.ok) {
-    audit({ event: "session.create", actor: user.email, outcome: "deny", reason: self.message });
+    audit({ event: "session.create", actor: actor.email, outcome: "deny", reason: self.message });
     return jsonError(422, "TARGET_OUT_OF_SCOPE", self.message);
   }
 
@@ -81,7 +96,7 @@ export async function POST(request: Request) {
     expiresAt: now + parsed.data.durationHours * 60 * 60 * 1000,
     status: "active",
     createdAt: now,
-    ownerId: user.sub,
+    ownerId: actor.id,
   };
 
   const token = await createTestingSessionToken(session, now);
@@ -94,7 +109,7 @@ export async function POST(request: Request) {
 
   audit({
     event: "session.create",
-    actor: user.email,
+    actor: actor.email,
     target: session.targetUrl,
     outcome: "allow",
     meta: { allowedDomains: session.allowedDomains.length, allowedPaths: session.allowedPaths.length },
@@ -107,11 +122,11 @@ export async function DELETE(request: Request) {
   const csrf = checkCsrf(request);
   if (!csrf.ok) return jsonError(403, "CSRF", csrf.reason ?? "request refused");
 
-  const user = await getCurrentUser();
-  if (!user) return jsonError(401, "UNAUTHENTICATED", "sign in required");
+  const actor = await getActor();
+  if (!actor) return jsonError(401, "UNAUTHENTICATED", "sign in required");
 
   const store = await cookies();
   store.delete(TESTING_SESSION_COOKIE);
-  audit({ event: "session.end", actor: user.email, outcome: "allow" });
+  audit({ event: "session.end", actor: actor.email, outcome: "allow" });
   return jsonOk({ ok: true });
 }

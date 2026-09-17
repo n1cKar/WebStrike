@@ -84,7 +84,7 @@ export function AppShell({
   user,
   children,
 }: {
-  user: { email: string };
+  user: { email: string; guest?: boolean };
   children: ReactNode;
 }) {
   const pathname = usePathname();
@@ -190,11 +190,17 @@ export function AppShell({
               End
             </Button>
             <div className="hidden max-w-[18ch] truncate text-xs text-muted-foreground sm:block">
-              {user.email}
+              {user.guest ? "Guest" : user.email}
             </div>
-            <Button variant="ghost" size="icon" onClick={logout} title="Sign out">
-              <LogOut className="size-4" />
-            </Button>
+            {user.guest ? (
+              <Badge variant="muted" className="mono hidden sm:inline-flex">
+                no account
+              </Badge>
+            ) : (
+              <Button variant="ghost" size="icon" onClick={logout} title="Sign out">
+                <LogOut className="size-4" />
+              </Button>
+            )}
           </div>
         </header>
 

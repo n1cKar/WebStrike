@@ -2,11 +2,12 @@ import { cookies } from "next/headers";
 import { requestSpecSchema } from "@webstrike/validation";
 import { checkCsrf } from "@/lib/api/csrf";
 import { jsonError, jsonOk, readJson, zodErrorResponse } from "@/lib/api/responses";
-import { getCurrentUser } from "@/lib/auth/current-user";
+import { getActor } from "@/lib/auth/actor";
 import { audit } from "@/lib/logging/audit";
 import { executeScopedRequest } from "@/lib/http";
 import { analyzeResponse } from "@/lib/analysis";
 import { TESTING_SESSION_COOKIE, readTestingSessionToken, scopeOf } from "@/lib/session/testing-session";
+import { actorRateKey } from "@/lib/security/client-key";
 import { acquireSlot, checkRateLimit, releaseSlot } from "@/lib/security/limits";
 
 export const runtime = "nodejs";
@@ -19,14 +20,16 @@ export async function POST(request: Request) {
   const csrf = checkCsrf(request);
   if (!csrf.ok) return jsonError(403, "CSRF", csrf.reason ?? "request refused");
 
-  const user = await getCurrentUser();
-  if (!user) return jsonError(401, "UNAUTHENTICATED", "sign in required");
+  const actor = await getActor();
+  if (!actor) return jsonError(401, "UNAUTHENTICATED", "sign in required");
+
+  const rateKey = actorRateKey(actor, request);
 
   const store = await cookies();
   const token = store.get(TESTING_SESSION_COOKIE)?.value;
   const session = token ? await readTestingSessionToken(token) : null;
 
-  if (!session || session.ownerId !== user.sub) {
+  if (!session || session.ownerId !== actor.id) {
     return jsonError(409, "NO_ACTIVE_SESSION", "create an authorised testing session first");
   }
   if (session.status === "expired") {
@@ -36,9 +39,9 @@ export async function POST(request: Request) {
     return jsonError(409, "SESSION_ENDED", "the testing session has ended");
   }
 
-  const rate = checkRateLimit(`req:${user.sub}`, RATE_LIMIT, RATE_WINDOW_MS);
+  const rate = checkRateLimit(`req:${rateKey}`, RATE_LIMIT, RATE_WINDOW_MS);
   if (!rate.ok) {
-    audit({ event: "security.refuse", actor: user.email, outcome: "deny", reason: "rate limit" });
+    audit({ event: "security.refuse", actor: actor.email, outcome: "deny", reason: "rate limit" });
     return jsonError(429, "RATE_LIMITED", "too many requests — slow down and retry shortly");
   }
 
@@ -46,7 +49,7 @@ export async function POST(request: Request) {
   const parsed = requestSpecSchema.safeParse(body);
   if (!parsed.success) return zodErrorResponse(parsed.error);
 
-  if (!acquireSlot(`run:${user.sub}`, MAX_IN_FLIGHT)) {
+  if (!acquireSlot(`run:${rateKey}`, MAX_IN_FLIGHT)) {
     return jsonError(429, "CONCURRENCY_LIMIT", "too many concurrent tests for this session");
   }
 
@@ -58,7 +61,7 @@ export async function POST(request: Request) {
       if ((refuseKinds as readonly string[]).includes(result.error.kind)) {
         audit({
           event: "security.refuse",
-          actor: user.email,
+          actor: actor.email,
           target: result.finalUrl,
           outcome: "deny",
           reason: `${result.error.kind}: ${result.error.detail ?? result.error.message}`,
@@ -74,7 +77,7 @@ export async function POST(request: Request) {
 
     audit({
       event: "request.execute",
-      actor: user.email,
+      actor: actor.email,
       target: new URL(parsed.data.url).host,
       outcome: "allow",
       meta: {
@@ -87,6 +90,6 @@ export async function POST(request: Request) {
 
     return jsonOk({ result, analysis: analyzeResponse(result) });
   } finally {
-    releaseSlot(`run:${user.sub}`);
+    releaseSlot(`run:${rateKey}`);
   }
 }

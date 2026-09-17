@@ -3,7 +3,7 @@ import { browserRunSchema } from "@webstrike/validation";
 import { CdpBrowserDriver, runBrowserChecks } from "@webstrike/testing";
 import { checkCsrf } from "@/lib/api/csrf";
 import { jsonError, jsonOk, readJson, zodErrorResponse } from "@/lib/api/responses";
-import { getCurrentUser } from "@/lib/auth/current-user";
+import { getActor } from "@/lib/auth/actor";
 import { browserConfigured, getBrowserConfig } from "@/lib/browser/config";
 import { audit } from "@/lib/logging/audit";
 import {
@@ -11,6 +11,7 @@ import {
   readTestingSessionToken,
   scopeOf,
 } from "@/lib/session/testing-session";
+import { actorRateKey } from "@/lib/security/client-key";
 import { acquireSlot, checkRateLimit, releaseSlot } from "@/lib/security/limits";
 
 export const runtime = "nodejs";
@@ -25,8 +26,10 @@ export async function POST(request: Request) {
   const csrf = checkCsrf(request);
   if (!csrf.ok) return jsonError(403, "CSRF", csrf.reason ?? "request refused");
 
-  const user = await getCurrentUser();
-  if (!user) return jsonError(401, "UNAUTHENTICATED", "sign in required");
+  const actor = await getActor();
+  if (!actor) return jsonError(401, "UNAUTHENTICATED", "sign in required");
+
+  const rateKey = actorRateKey(actor, request);
 
   if (!browserConfigured()) {
     return jsonError(
@@ -40,7 +43,7 @@ export async function POST(request: Request) {
   const token = store.get(TESTING_SESSION_COOKIE)?.value;
   const session = token ? await readTestingSessionToken(token) : null;
 
-  if (!session || session.ownerId !== user.sub) {
+  if (!session || session.ownerId !== actor.id) {
     return jsonError(409, "NO_ACTIVE_SESSION", "create an authorised testing session first");
   }
   if (session.status === "expired") {
@@ -50,9 +53,9 @@ export async function POST(request: Request) {
     return jsonError(409, "SESSION_ENDED", "the testing session has ended");
   }
 
-  const rate = checkRateLimit(`browser:${user.sub}`, RATE_LIMIT, RATE_WINDOW_MS);
+  const rate = checkRateLimit(`browser:${rateKey}`, RATE_LIMIT, RATE_WINDOW_MS);
   if (!rate.ok) {
-    audit({ event: "security.refuse", actor: user.email, outcome: "deny", reason: "rate limit" });
+    audit({ event: "security.refuse", actor: actor.email, outcome: "deny", reason: "rate limit" });
     return jsonError(429, "RATE_LIMITED", "too many browser runs — retry in a few minutes");
   }
 
@@ -60,13 +63,13 @@ export async function POST(request: Request) {
   const parsed = browserRunSchema.safeParse(body ?? {});
   if (!parsed.success) return zodErrorResponse(parsed.error);
 
-  if (!acquireSlot(`browser:${user.sub}`, MAX_IN_FLIGHT)) {
+  if (!acquireSlot(`browser:${rateKey}`, MAX_IN_FLIGHT)) {
     return jsonError(429, "CONCURRENCY_LIMIT", "a browser run is already in progress");
   }
 
   const config = getBrowserConfig();
   if (!config) {
-    releaseSlot(`browser:${user.sub}`);
+    releaseSlot(`browser:${rateKey}`);
     return jsonError(503, "BROWSER_NOT_CONFIGURED", "browser endpoint is not configured");
   }
 
@@ -81,7 +84,7 @@ export async function POST(request: Request) {
 
     audit({
       event: "request.execute",
-      actor: user.email,
+      actor: actor.email,
       target: new URL(session.targetUrl).host,
       outcome: "allow",
       meta: {
@@ -96,7 +99,7 @@ export async function POST(request: Request) {
   } catch (error) {
     audit({
       event: "security.refuse",
-      actor: user.email,
+      actor: actor.email,
       target: new URL(session.targetUrl).host,
       outcome: "deny",
       reason: error instanceof Error ? error.message : "browser run failed",
@@ -114,6 +117,6 @@ export async function POST(request: Request) {
         /* best effort */
       }
     }
-    releaseSlot(`browser:${user.sub}`);
+    releaseSlot(`browser:${rateKey}`);
   }
 }

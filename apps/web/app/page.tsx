@@ -54,10 +54,10 @@ export default function HomePage() {
         </div>
         <div className="flex items-center gap-2">
           <Button asChild variant="ghost" size="sm">
-            <Link href="/login">Sign in</Link>
+            <Link href="/automated">Automated checks</Link>
           </Button>
           <Button asChild size="sm">
-            <Link href="/register">Get started</Link>
+            <Link href="/dashboard">Open WebStrike</Link>
           </Button>
         </div>
       </header>
@@ -79,12 +79,12 @@ export default function HomePage() {
           </p>
           <div className="mt-8 flex flex-wrap gap-3">
             <Button asChild size="lg">
-              <Link href="/register">
-                Create a testing account <ArrowRight className="size-4" />
+              <Link href="/new-session">
+                Start a testing session <ArrowRight className="size-4" />
               </Link>
             </Button>
             <Button asChild variant="outline" size="lg">
-              <Link href="/login">I already have an account</Link>
+              <Link href="/dashboard">Open the dashboard</Link>
             </Button>
           </div>
         </section>
